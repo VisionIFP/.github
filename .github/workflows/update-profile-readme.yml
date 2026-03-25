@@ -1,0 +1,185 @@
+name: Update Profile README
+
+on:
+  schedule:
+    - cron: '0 8 1 * *' # 08:00 UTC on the 1st of every month
+  workflow_dispatch: # Allow manual runs from the Actions tab
+
+permissions:
+  contents: write  # To commit the updated README
+  models: read     # To call GitHub Models inference API
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Fetch VisionIFP website
+        run: |
+          curl -s --max-time 30 https://visionifp.co.uk \
+            | sed 's/<[^>]*>//g' \
+            | tr -s ' \t' ' ' \
+            | awk 'NF' \
+            | head -400 > /tmp/page.txt
+
+          echo "Fetched $(wc -l < /tmp/page.txt) lines"
+
+      - name: Extract stats via GitHub Models (Claude Sonnet)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PAGE=$(cat /tmp/page.txt)
+
+          # Build the JSON payload using Python to safely handle escaping
+          python3 - <<PYEOF > /tmp/payload.json
+          import json
+
+          with open("/tmp/page.txt") as f:
+              page = f.read()
+
+          payload = {
+              "model": "anthropic/claude-4-sonnet",
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "You are a data extraction tool. "
+                          "Return ONLY a valid JSON object. No explanation, no markdown, no code fences."
+                      )
+                  },
+                  {
+                      "role": "user",
+                      "content": (
+                          "Extract the following from this text scraped from the Vision IFP website:\n"
+                          "1. The number of Appointed Representatives (digits only, e.g. 142)\n"
+                          "2. The Funds Under Advice figure (with symbol and unit, e.g. £6.9 billion)\n"
+                          "3. All awards and accolades mentioned — names only, no years\n\n"
+                          "Return this exact JSON structure with no other text:\n"
+                          '{\n'
+                          '  "adviser_count": "142",\n'
+                          '  "fua": "£6.9 billion",\n'
+                          '  "awards": [\n'
+                          '    "Professional Adviser Awards — Best Financial Advisers to Work For"\n'
+                          '  ]\n'
+                          '}\n\n'
+                          f"Website text:\n{page}"
+                      )
+                  }
+              ],
+              "max_tokens": 500,
+              "temperature": 0
+          }
+
+          print(json.dumps(payload))
+          PYEOF
+
+          # Call GitHub Models API - authenticated with the built-in GITHUB_TOKEN
+          curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/payload.json \
+            https://models.github.ai/inference/chat/completions \
+            > /tmp/response.json
+
+          echo "API response received"
+          cat /tmp/response.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('choices',[{}])[0].get('message',{}).get('content','ERROR')[:200])"
+
+      - name: Parse response and update README
+        run: |
+          python3 - <<'PYEOF'
+          import re, json, sys
+          from datetime import datetime
+
+          # Pull the message content out of the API response
+          with open("/tmp/response.json") as f:
+              response = json.load(f)
+
+          content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+          if not content:
+              print("ERROR: No content in API response")
+              print(json.dumps(response, indent=2))
+              sys.exit(1)
+
+          print(f"Raw content: {content[:300]}")
+
+          # Extract JSON from the response (handles any stray whitespace or fences)
+          match = re.search(r'\{.*\}', content, re.DOTALL)
+          if not match:
+              print("ERROR: No JSON object found in response")
+              sys.exit(1)
+
+          try:
+              data = json.loads(match.group())
+          except json.JSONDecodeError as e:
+              print(f"ERROR: JSON parse failed: {e}")
+              sys.exit(1)
+
+          adviser_count = data.get("adviser_count", "").strip()
+          fua = data.get("fua", "").strip()
+          awards = [a.strip() for a in data.get("awards", []) if a.strip()]
+
+          print(f"adviser_count: {adviser_count}")
+          print(f"fua: {fua}")
+          print(f"awards: {awards}")
+
+          if not adviser_count or not fua or not awards:
+              print("ERROR: Missing one or more required fields")
+              sys.exit(1)
+
+          # Read the README
+          with open("profile/README.md") as f:
+              readme = f.read()
+
+          # Update adviser count
+          readme = re.sub(
+              r'<!-- ADVISER_COUNT -->.*?<!-- /ADVISER_COUNT -->',
+              f'<!-- ADVISER_COUNT -->{adviser_count}<!-- /ADVISER_COUNT -->',
+              readme
+          )
+
+          # Update FUA
+          readme = re.sub(
+              r'<!-- FUA -->.*?<!-- /FUA -->',
+              f'<!-- FUA -->{fua}<!-- /FUA -->',
+              readme
+          )
+
+          # Update awards block
+          awards_md = "\n".join(f"- 🏆 {award}" for award in awards)
+          readme = re.sub(
+              r'(## Consistently Award Winning\n\n)(.*?)(\n\n<!-- AWARDS_END -->)',
+              rf'\g<1>{awards_md}\g<3>',
+              readme,
+              flags=re.DOTALL
+          )
+
+          # Stamp last updated
+          month_year = datetime.utcnow().strftime("%B %Y")
+          readme = re.sub(
+              r'<!-- LAST_UPDATED -->.*?<!-- /LAST_UPDATED -->',
+              f'<!-- LAST_UPDATED -->Last updated: {month_year}<!-- /LAST_UPDATED -->',
+              readme
+          )
+
+          with open("profile/README.md", "w") as f:
+              f.write(readme)
+
+          print(f"✓ README updated — {month_year}")
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add profile/README.md
+          if git diff --cached --quiet; then
+            echo "No changes — README is already up to date."
+          else
+            git commit -m "chore: update profile README stats [skip ci]"
+            git push
+            echo "✓ Pushed."
+          fi
